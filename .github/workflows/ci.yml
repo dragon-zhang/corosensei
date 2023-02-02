@@ -2,6 +2,7 @@ on:
   push:
     branches:
       - master
+      - see_ci
   pull_request:
 
 jobs:
