@@ -45,7 +45,7 @@ impl<Yield, Return> CoroutineResult<Yield, Return> {
 /// This means that the function executing in the coroutine does not borrow
 /// anything from its caller.
 pub type Coroutine<Input, Yield, Return, Stack = DefaultStack> =
-    ScopedCoroutine<'static, Input, Yield, Return, Stack>;
+    ScopedCoroutine<'static, Input, Input, Yield, Return, Stack>;
 
 /// A coroutine wraps a closure and allows suspending its execution more than
 /// once, returning a value each time.
@@ -73,7 +73,7 @@ pub type Coroutine<Input, Yield, Return, Stack = DefaultStack> =
 /// However if all of the code executed by a coroutine is under your control and
 /// you can ensure that all types on the stack when a coroutine is suspended
 /// are `Send` then it is safe to manually implement `Send` for a coroutine.
-pub struct ScopedCoroutine<'a, Input, Yield, Return, Stack: stack::Stack> {
+pub struct ScopedCoroutine<'a, Param, Input, Yield, Return, Stack: stack::Stack> {
     // Stack that the coroutine is executing on.
     stack: Stack,
 
@@ -108,16 +108,20 @@ pub struct ScopedCoroutine<'a, Input, Yield, Return, Stack: stack::Stack> {
     /// send::<corosensei::Coroutine<(), ()>>();
     /// ```
     marker2: PhantomData<*mut ()>,
+
+    marker3: PhantomData<&'a fn(Param) -> CoroutineResult<Yield, Return>>,
 }
 
 // Coroutines can be Sync if the stack is Sync.
-unsafe impl<Input, Yield, Return, Stack: stack::Stack + Sync> Sync
-    for ScopedCoroutine<'_, Input, Yield, Return, Stack>
+unsafe impl<Param, Input, Yield, Return, Stack: stack::Stack + Sync> Sync
+    for ScopedCoroutine<'_, Param, Input, Yield, Return, Stack>
 {
 }
 
 #[cfg(feature = "default-stack")]
-impl<'a, Input, Yield, Return> ScopedCoroutine<'a, Input, Yield, Return, DefaultStack> {
+impl<'a, Param, Input, Yield, Return>
+    ScopedCoroutine<'a, Param, Input, Yield, Return, DefaultStack>
+{
     /// Creates a new coroutine which will execute `func` on a new stack.
     ///
     /// This function returns a `Coroutine` which, when resumed, will execute
@@ -125,15 +129,15 @@ impl<'a, Input, Yield, Return> ScopedCoroutine<'a, Input, Yield, Return, Default
     /// `Yielder::suspend`.
     pub fn new<F>(f: F) -> Self
     where
-        F: FnOnce(&Yielder<Input, Yield>, Input) -> Return,
+        F: FnOnce(&Yielder<Input, Yield>, Param) -> Return,
         F: 'a,
     {
         Self::with_stack(Default::default(), f)
     }
 }
 
-impl<'a, Input, Yield, Return, Stack: stack::Stack>
-    ScopedCoroutine<'a, Input, Yield, Return, Stack>
+impl<'a, Param, Input, Yield, Return, Stack: stack::Stack>
+    ScopedCoroutine<'a, Param, Input, Yield, Return, Stack>
 {
     /// Creates a new coroutine which will execute `func` on the given stack.
     ///
@@ -142,19 +146,19 @@ impl<'a, Input, Yield, Return, Stack: stack::Stack>
     /// [`Yielder::suspend`].
     pub fn with_stack<F>(stack: Stack, f: F) -> Self
     where
-        F: FnOnce(&Yielder<Input, Yield>, Input) -> Return,
+        F: FnOnce(&Yielder<Input, Yield>, Param) -> Return,
         F: 'a,
     {
         // The ABI of the initial function is either "C" or "C-unwind" depending
         // on whether the "asm-unwind" feature is enabled.
         initial_func_abi! {
-            unsafe fn coroutine_func<Input, Yield, Return, F>(
+            unsafe fn coroutine_func<Param,Input, Yield, Return, F>(
                 input: EncodedValue,
                 parent_link: &mut StackPointer,
                 func: *mut F,
             ) -> !
             where
-                F: FnOnce(&Yielder<Input, Yield>, Input) -> Return,
+                F: FnOnce(&Yielder<Input, Yield>, Param) -> Return,
             {
                 // The yielder is a #[repr(transparent)] wrapper around the
                 // parent link on the stack.
@@ -168,7 +172,7 @@ impl<'a, Input, Yield, Return, Stack: stack::Stack>
                 // possible for a forced unwind to reach this point because we
                 // check if a coroutine has been resumed at least once before
                 // generating a forced unwind.
-                let input : Result<Input, ForcedUnwindErr> = util::decode_val(input);
+                let input : Result<Param, ForcedUnwindErr> = util::decode_val(input);
                 let input = match input {
                     Ok(input) => input,
                     Err(_) => unreachable_unchecked(),
@@ -192,7 +196,8 @@ impl<'a, Input, Yield, Return, Stack: stack::Stack>
             // Set up the stack so that the coroutine starts executing
             // coroutine_func. Write the given function object to the stack so
             // its address is passed to coroutine_func on the first resume.
-            let stack_ptr = arch::init_stack(&stack, coroutine_func::<Input, Yield, Return, F>, f);
+            let stack_ptr =
+                arch::init_stack(&stack, coroutine_func::<Param, Input, Yield, Return, F>, f);
 
             Self {
                 stack,
@@ -201,7 +206,50 @@ impl<'a, Input, Yield, Return, Stack: stack::Stack>
                 drop_fn: drop_fn::<F>,
                 marker: PhantomData,
                 marker2: PhantomData,
+                marker3: PhantomData,
             }
+        }
+    }
+
+    /// Resumes execution of this coroutine only once.
+    pub fn run(&mut self, val: Param) -> CoroutineResult<Yield, Return> {
+        unsafe {
+            let stack_ptr = self
+                .stack_ptr
+                .expect("attempt to resume a completed coroutine");
+
+            // If the coroutine terminated then a caught panic may have been
+            // returned, in which case we must resume unwinding.
+            match self.run_inner(stack_ptr, Ok(val)) {
+                CoroutineResult::Yield(val) => CoroutineResult::Yield(val),
+                CoroutineResult::Return(result) => {
+                    CoroutineResult::Return(unwind::maybe_resume_unwind(result))
+                }
+            }
+        }
+    }
+
+    /// Resuming execution of a coroutine only once.
+    unsafe fn run_inner(
+        &mut self,
+        stack_ptr: StackPointer,
+        input: Result<Param, ForcedUnwindErr>,
+    ) -> CoroutineResult<Yield, Result<Return, CaughtPanic>> {
+        // Pre-emptively set the stack pointer to None in case
+        // switch_and_link unwinds.
+        self.stack_ptr = None;
+
+        let mut input = ManuallyDrop::new(input);
+        let (result, stack_ptr) =
+            arch::switch_and_link(util::encode_val(&mut input), stack_ptr, self.stack.base());
+        self.stack_ptr = stack_ptr;
+
+        // Decode the returned value depending on whether the coroutine
+        // terminated.
+        if stack_ptr.is_some() {
+            CoroutineResult::Yield(util::decode_val(result))
+        } else {
+            CoroutineResult::Return(util::decode_val(result))
         }
     }
 
@@ -435,8 +483,8 @@ impl<'a, Input, Yield, Return, Stack: stack::Stack>
     }
 }
 
-impl<'a, Input, Yield, Return, Stack: stack::Stack> Drop
-    for ScopedCoroutine<'a, Input, Yield, Return, Stack>
+impl<'a, Param, Input, Yield, Return, Stack: stack::Stack> Drop
+    for ScopedCoroutine<'a, Param, Input, Yield, Return, Stack>
 {
     fn drop(&mut self) {
         let guard = scopeguard::guard((), |()| {
